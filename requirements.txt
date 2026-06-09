@@ -1,0 +1,9 @@
+
+# REQUERIDO
+# ========
+# Librería SSH/SFTP para conectar a servidores remotos
+paramiko>=2.12.0
+
+# Conversión robusta de claves (incluyendo .ppk de PuTTY)
+cryptography>=41.0.0
+# =====
