@@ -726,6 +726,7 @@ class DirectoryComparator:
         return all_files
 
     def get_diff(self, rel_path: str) -> str:
+        """Formato unificado (deprecated, usa get_diff_side_by_side)"""
         local_content = self._read_local_file(rel_path).splitlines(keepends=True)
         remote_content = self._read_remote_file(rel_path).splitlines(keepends=True)
 
@@ -738,6 +739,85 @@ class DirectoryComparator:
         )
 
         return '\n'.join(diff)
+
+    def get_diff_side_by_side(self, rel_path: str) -> Dict:
+        """Genera diff lado a lado para mejor visualización"""
+        local_content = self._read_local_file(rel_path).splitlines()
+        remote_content = self._read_remote_file(rel_path).splitlines()
+
+        # Usar SequenceMatcher para alineación
+        matcher = difflib.SequenceMatcher(None, remote_content, local_content)
+        opcodes = matcher.get_opcodes()
+
+        side_by_side = []
+        remote_line_num = 1
+        local_line_num = 1
+
+        for tag, i1, i2, j1, j2 in opcodes:
+            if tag == 'equal':
+                # Lineas iguales
+                for i in range(i2 - i1):
+                    side_by_side.append({
+                        'type': 'equal',
+                        'remote_line': remote_line_num,
+                        'remote_text': remote_content[i1 + i] if i1 + i < len(remote_content) else '',
+                        'local_line': local_line_num,
+                        'local_text': local_content[j1 + i] if j1 + i < len(local_content) else ''
+                    })
+                    remote_line_num += 1
+                    local_line_num += 1
+
+            elif tag == 'replace':
+                # Lineas modificadas
+                max_lines = max(i2 - i1, j2 - j1)
+                for i in range(max_lines):
+                    remote_text = remote_content[i1 + i] if i1 + i < i2 else ''
+                    local_text = local_content[j1 + i] if j1 + i < j2 else ''
+
+                    side_by_side.append({
+                        'type': 'replace',
+                        'remote_line': remote_line_num if i1 + i < i2 else None,
+                        'remote_text': remote_text,
+                        'local_line': local_line_num if j1 + i < j2 else None,
+                        'local_text': local_text
+                    })
+
+                    if i1 + i < i2:
+                        remote_line_num += 1
+                    if j1 + i < j2:
+                        local_line_num += 1
+
+            elif tag == 'delete':
+                # Lineas eliminadas (solo en remoto)
+                for i in range(i1, i2):
+                    side_by_side.append({
+                        'type': 'delete',
+                        'remote_line': remote_line_num,
+                        'remote_text': remote_content[i],
+                        'local_line': None,
+                        'local_text': ''
+                    })
+                    remote_line_num += 1
+
+            elif tag == 'insert':
+                # Lineas insertadas (solo en local)
+                for i in range(j1, j2):
+                    side_by_side.append({
+                        'type': 'insert',
+                        'remote_line': None,
+                        'remote_text': '',
+                        'local_line': local_line_num,
+                        'local_text': local_content[i]
+                    })
+                    local_line_num += 1
+
+        return {
+            'path': rel_path,
+            'total_lines': max(len(remote_content), len(local_content)),
+            'remote_lines': len(remote_content),
+            'local_lines': len(local_content),
+            'changes': side_by_side
+        }
 
     def close(self):
         if self.sftp_client:
@@ -892,11 +972,8 @@ class ComparatorWebHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            diff = self.__class__.current_comparator.get_diff(rel_path)
-            self.send_response(200)
-            self.send_header('Content-type', 'text/plain; charset=utf-8')
-            self.end_headers()
-            self.wfile.write(diff.encode('utf-8'))
+            diff_data = self.__class__.current_comparator.get_diff_side_by_side(rel_path)
+            self.send_json_response(diff_data)
         except Exception as e:
             self.send_json_response({'error': str(e)}, 400)
 
@@ -1189,20 +1266,147 @@ class ComparatorWebHandler(BaseHTTPRequestHandler):
             background: #f5f5f5;
             padding: 15px;
             border-radius: 6px;
-            max-height: 600px;
-            overflow-y: auto;
+            max-height: 700px;
+            overflow: auto;
             font-family: 'Courier New', monospace;
             font-size: 12px;
-            line-height: 1.4;
+            line-height: 1.5;
         }
+
+        /* Vista lado a lado */
+        .diff-table {
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+        }
+
+        .diff-table tbody tr {
+            border-bottom: 1px solid #e0e0e0;
+        }
+
+        .diff-table tbody tr:hover {
+            background: #f9f9f9;
+        }
+
+        .diff-table td {
+            padding: 0;
+            width: 50%;
+            vertical-align: top;
+        }
+
+        .diff-line-num {
+            background: #f0f0f0;
+            color: #999;
+            padding: 4px 8px;
+            text-align: right;
+            width: 40px;
+            user-select: none;
+            border-right: 1px solid #ddd;
+            font-size: 11px;
+            flex-shrink: 0;
+        }
+
+        .diff-line-content {
+            padding: 4px 8px;
+            white-space: pre-wrap;
+            word-break: break-word;
+            flex: 1;
+            overflow-x: auto;
+        }
+
+        .diff-remote {
+            border-left: 3px solid #ffcdd2;
+            border-right: 1px solid #e0e0e0;
+        }
+
+        .diff-local {
+            border-left: 3px solid #c8e6c9;
+        }
+
+        .diff-equal .diff-line-content {
+            background: #fafafa;
+            color: #333;
+        }
+
+        .diff-delete .diff-line-content {
+            background: #ffebee;
+            color: #c62828;
+        }
+
+        .diff-insert .diff-line-content {
+            background: #e8f5e9;
+            color: #2e7d32;
+        }
+
+        .diff-replace-remote {
+            background: #ffe0b2 !important;
+            color: #e65100 !important;
+        }
+
+        .diff-replace-local {
+            background: #bbdefb !important;
+            color: #0d47a1 !important;
+        }
+
+        .diff-header-row {
+            background: #e3f2fd;
+            font-weight: bold;
+            padding: 10px;
+            text-align: center;
+            color: #0066cc;
+            border-bottom: 2px solid #0066cc;
+        }
+
+        .diff-header-container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0;
+            margin-bottom: 15px;
+            border: 1px solid #0066cc;
+            border-radius: 4px 4px 0 0;
+            overflow: hidden;
+        }
+
+        .diff-column-header {
+            padding: 12px;
+            background: #e3f2fd;
+            color: #0066cc;
+            font-weight: bold;
+            text-align: center;
+            border-right: 1px solid #0066cc;
+        }
+
+        .diff-column-header:last-child {
+            border-right: none;
+        }
+
+        .diff-stats {
+            background: #f5f5f5;
+            padding: 12px;
+            border-radius: 6px;
+            margin-bottom: 15px;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            font-size: 12px;
+        }
+
+        .diff-stats-item {
+            padding: 8px;
+            background: white;
+            border-radius: 4px;
+            border-left: 3px solid #0066cc;
+        }
+
         .diff-line {
             white-space: pre-wrap;
             word-break: break-all;
         }
-        .diff-add { background: #e8f5e9; color: #2e7d32; padding: 2px 4px; }
-        .diff-remove { background: #ffebee; color: #c62828; padding: 2px 4px; }
-        .diff-context { color: #666; }
-        .diff-header { color: #0066cc; font-weight: bold; }
+
+        .diff-line.diff-add { background: #e8f5e9; color: #2e7d32; padding: 2px 4px; }
+        .diff-line.diff-remove { background: #ffebee; color: #c62828; padding: 2px 4px; }
+        .diff-line.diff-context { color: #666; }
+        .diff-line.diff-header { color: #0066cc; font-weight: bold; }
 
         .empty-state {
             text-align: center;
@@ -1228,19 +1432,19 @@ class ComparatorWebHandler(BaseHTTPRequestHandler):
 </head>
 <body>
     <div class="container">
-        <h1> Comparador de Directorios</h1>
+        <h1>🔍 Comparador de Directorios</h1>
 
         <div class="card">
-            <h2 style="color: #333; margin-bottom: 20px;">️ Configuración</h2>
+            <h2 style="color: #333; margin-bottom: 20px;">⚙️ Configuración</h2>
 
             <div class="form-section">
                 <div class="form-group">
-                    <label for="local_path"> Ruta Local</label>
+                    <label for="local_path">📁 Ruta Local</label>
                     <input type="text" id="local_path" placeholder="~/carpeta_local o /ruta/absoluta">
                 </div>
 
                 <div class="form-group">
-                    <label for="remote_path"> Ruta Remota</label>
+                    <label for="remote_path">📁 Ruta Remota</label>
                     <input type="text" id="remote_path" placeholder="~/carpeta_remota o /ruta/absoluta">
                 </div>
 
@@ -1256,25 +1460,25 @@ class ComparatorWebHandler(BaseHTTPRequestHandler):
             <!-- Configuración SSH -->
             <div id="ssh_config" class="ssh-config">
                 <div style="grid-column: 1 / -1; background: white; padding: 12px; border-radius: 4px; border-left: 4px solid #e74c3c; margin-bottom: 10px; font-size: 13px; color: #555;">
-                     <strong>Opciones de autenticación:</strong> Proporciona contraseña, clave SSH, o déjalas vacías si usas ssh-agent o claves por defecto en ~/.ssh/
+                    💡 <strong>Opciones de autenticación:</strong> Proporciona contraseña, clave SSH, o déjalas vacías si usas ssh-agent o claves por defecto en ~/.ssh/
                 </div>
                 <div class="form-group">
-                    <label for="ssh_host"> Host SSH</label>
+                    <label for="ssh_host">🌐 Host SSH</label>
                     <input type="text" id="ssh_host" placeholder="servidor.com">
                 </div>
 
                 <div class="form-group">
-                    <label for="ssh_user"> Usuario</label>
+                    <label for="ssh_user">👤 Usuario</label>
                     <input type="text" id="ssh_user" placeholder="usuario">
                 </div>
 
                 <div class="form-group">
-                    <label for="ssh_port"> Puerto</label>
+                    <label for="ssh_port">🔌 Puerto</label>
                     <input type="text" id="ssh_port" placeholder="22" value="22">
                 </div>
 
                 <div class="form-group">
-                    <label> Autenticación</label>
+                    <label>🔐 Autenticación</label>
                     <select id="auth_method">
                         <option value="password">Contraseña</option>
                         <option value="key">Clave privada</option>
@@ -1282,12 +1486,12 @@ class ComparatorWebHandler(BaseHTTPRequestHandler):
                 </div>
 
                 <div class="form-group" id="password_group">
-                    <label for="ssh_password"> Contraseña (opcional)</label>
+                    <label for="ssh_password">🔑 Contraseña (opcional)</label>
                     <input type="password" id="ssh_password" placeholder="Dejar vacío si no la necesita">
                 </div>
 
                 <div class="form-group" id="key_group" style="display: none;">
-                    <label for="ssh_key">🗝 Ruta de Clave (opcional)</label>
+                    <label for="ssh_key">🗝️ Ruta de Clave (opcional)</label>
                     <input type="text" id="ssh_key" placeholder="~/.ssh/id_rsa">
                 </div>
             </div>
@@ -1295,7 +1499,7 @@ class ComparatorWebHandler(BaseHTTPRequestHandler):
             <!-- Botones -->
             <div class="button-group">
                 <button class="btn-primary" id="compare_btn" onclick="compareDirectories()">
-                     Comparar Directorios
+                    🚀 Comparar Directorios
                 </button>
                 <button class="btn-reset" onclick="resetForm()">Limpiar</button>
             </div>
@@ -1306,16 +1510,16 @@ class ComparatorWebHandler(BaseHTTPRequestHandler):
 
         <!-- Resultados -->
         <div id="results_section" class="card" style="display: none;">
-            <h2 style="color: #333; margin-bottom: 15px;"> Resultados</h2>
+            <h2 style="color: #333; margin-bottom: 15px;">📊 Resultados</h2>
 
             <div id="stats" class="stats"></div>
 
             <div class="filter-buttons">
                 <button class="filter-btn active" data-filter="all">Todos</button>
                 <button class="filter-btn" data-filter="idéntico">✓ Idénticos</button>
-                <button class="filter-btn" data-filter="contenido diferente">️ Diferentes</button>
-                <button class="filter-btn" data-filter="falta en remoto"> Falta remoto</button>
-                <button class="filter-btn" data-filter="falta en local"> Falta local</button>
+                <button class="filter-btn" data-filter="contenido diferente">⚠️ Diferentes</button>
+                <button class="filter-btn" data-filter="falta en remoto">❌ Falta remoto</button>
+                <button class="filter-btn" data-filter="falta en local">❌ Falta local</button>
             </div>
 
             <div id="file_list" class="file-list"></div>
@@ -1386,7 +1590,7 @@ class ComparatorWebHandler(BaseHTTPRequestHandler):
             const isRemote = document.getElementById('is_remote').checked;
 
             if (!localPath || !remotePath) {
-                showStatus(' Completa todas las rutas', 'error');
+                showStatus('❌ Completa todas las rutas', 'error');
                 return;
             }
 
@@ -1408,7 +1612,7 @@ class ComparatorWebHandler(BaseHTTPRequestHandler):
                 const authMethod = document.getElementById('auth_method').value;
 
                 if (!sshHost || !sshUser) {
-                    showStatus(' Host y usuario SSH son requeridos', 'error');
+                    showStatus('❌ Host y usuario SSH son requeridos', 'error');
                     isComparing = false;
                     document.getElementById('compare_btn').disabled = false;
                     return;
@@ -1433,14 +1637,14 @@ class ComparatorWebHandler(BaseHTTPRequestHandler):
             .then(r => r.json())
             .then(result => {
                 if (result.error) {
-                    showStatus(` ${result.error}`, 'error');
+                    showStatus(`❌ ${result.error}`, 'error');
                 } else {
-                    showStatus(` ${result.message}`, 'success');
+                    showStatus(`✅ ${result.message}`, 'success');
                     loadResults();
                 }
             })
             .catch(e => {
-                showStatus(` Error: ${e.message}`, 'error');
+                showStatus(`❌ Error: ${e.message}`, 'error');
             })
             .finally(() => {
                 isComparing = false;
@@ -1500,7 +1704,7 @@ class ComparatorWebHandler(BaseHTTPRequestHandler):
 
             if (filtered.length === 0) {
                 document.getElementById('file_list').innerHTML = 
-                    '<div class="empty-state"><div class="empty-state-icon"></div><p>Sin archivos en esta categoría</p></div>';
+                    '<div class="empty-state"><div class="empty-state-icon">📭</div><p>Sin archivos en esta categoría</p></div>';
                 return;
             }
 
@@ -1510,7 +1714,7 @@ class ComparatorWebHandler(BaseHTTPRequestHandler):
                 html += `
                     <div class="file-item" onclick="showDetails('${escapeJs(file.path)}')">
                         <div class="file-header">
-                            <div class="file-name"> ${escapeHtml(file.path)}</div>
+                            <div class="file-name">📄 ${escapeHtml(file.path)}</div>
                             <div class="file-status ${statusClass}">${file.status}</div>
                         </div>
                     </div>
@@ -1528,21 +1732,76 @@ class ComparatorWebHandler(BaseHTTPRequestHandler):
 
             if (file.status === 'contenido diferente') {
                 fetch(`/api/diff/${encodeURIComponent(path)}`)
-                    .then(r => r.text())
-                    .then(diff => {
-                        const lines = diff.split('\\n');
+                    .then(r => r.json())
+                    .then(diffData => {
+                        // Generar HTML lado a lado
                         let html = '<div class="diff-container">';
-                        lines.forEach(line => {
-                            let cls = 'diff-context';
-                            if (line.startsWith('+++')) cls = 'diff-header';
-                            if (line.startsWith('---')) cls = 'diff-header';
-                            if (line.startsWith('@@')) cls = 'diff-header';
-                            if (line.startsWith('+')) cls = 'diff-add';
-                            if (line.startsWith('-')) cls = 'diff-remove';
-                            html += `<div class="diff-line ${cls}">${escapeHtml(line)}</div>`;
+
+                        // Encabezado con estadísticas
+                        html += `
+                            <div class="diff-stats">
+                                <div class="diff-stats-item">
+                                    <strong>Remoto:</strong> ${diffData.remote_lines} líneas
+                                </div>
+                                <div class="diff-stats-item">
+                                    <strong>Local:</strong> ${diffData.local_lines} líneas
+                                </div>
+                            </div>
+                        `;
+
+                        // Headers de columnas
+                        html += `
+                            <div class="diff-header-container">
+                                <div class="diff-column-header remote">📋 Remoto</div>
+                                <div class="diff-column-header local">📝 Local</div>
+                            </div>
+                        `;
+
+                        // Tabla de diff
+                        html += '<table class="diff-table">';
+
+                        diffData.changes.forEach(change => {
+                            const rowClass = change.type === 'equal' ? 'diff-equal' : 
+                                           change.type === 'delete' ? 'diff-delete' :
+                                           change.type === 'insert' ? 'diff-insert' : 'diff-replace';
+
+                            const remoteClass = change.type === 'replace' ? 'diff-replace-remote' : '';
+                            const localClass = change.type === 'replace' ? 'diff-replace-local' : '';
+
+                            html += `<tr class="diff-row ${rowClass}">`;
+
+                            // Columna remoto
+                            html += '<td class="diff-remote">';
+                            if (change.remote_line) {
+                                html += `<div style="display: flex;"><div class="diff-line-num">${change.remote_line}</div><div class="diff-line-content ${remoteClass}">${escapeHtml(change.remote_text)}</div></div>`;
+                            } else {
+                                html += '<div style="display: flex;"><div class="diff-line-num"></div><div class="diff-line-content" style="background: #f5f5f5;"></div></div>';
+                            }
+                            html += '</td>';
+
+                            // Columna local
+                            html += '<td class="diff-local">';
+                            if (change.local_line) {
+                                html += `<div style="display: flex;"><div class="diff-line-num">${change.local_line}</div><div class="diff-line-content ${localClass}">${escapeHtml(change.local_text)}</div></div>`;
+                            } else {
+                                html += '<div style="display: flex;"><div class="diff-line-num"></div><div class="diff-line-content" style="background: #f5f5f5;"></div></div>';
+                            }
+                            html += '</td>';
+
+                            html += '</tr>';
                         });
+
+                        html += '</table>';
                         html += '</div>';
+
                         document.getElementById('detail_content').innerHTML = html;
+                    })
+                    .catch(e => {
+                        document.getElementById('detail_content').innerHTML = `
+                            <div style="color: #c62828; padding: 20px;">
+                                <strong>Error al cargar diff:</strong> ${escapeHtml(e.message)}
+                            </div>
+                        `;
                     });
             } else {
                 let info = '<p><strong>Estado:</strong> ' + file.status + '</p>';
@@ -1611,12 +1870,12 @@ def main():
         server = HTTPServer((args.host, port), ComparatorWebHandler)
 
         print(f"\n{'=' * 70}")
-        print(f" Comparador de Directorios Web")
+        print(f"🌐 Comparador de Directorios Web")
         print(f"{'=' * 70}")
         print(f"\n✓ Servidor activo en: http://{args.host}:{port}")
-        print(f"\n Abre esta URL en tu navegador")
-        print(f" El servidor se mantiene activo - puedes hacer múltiples comparaciones")
-        print(f"\n️  Presiona Ctrl+C para detener\n")
+        print(f"\n💡 Abre esta URL en tu navegador")
+        print(f"📌 El servidor se mantiene activo - puedes hacer múltiples comparaciones")
+        print(f"\n⌨️  Presiona Ctrl+C para detener\n")
 
         import webbrowser
         import time
