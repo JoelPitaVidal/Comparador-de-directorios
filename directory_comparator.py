@@ -1,24 +1,108 @@
-#!/usr/bin/env python3
-"""
-Comparador de directorios con interfaz web interactiva
-Permite escribir rutas, seleccionar local/remoto y mantiene el servidor activo
-"""
-
-import os
 import os
 import json
 import hashlib
 import difflib
+import re
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 import argparse
 from dataclasses import dataclass, asdict
-import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 import socket
 from datetime import datetime
 import traceback
+
+
+# ============================================================================
+# FUNCIONES DE PERSISTENCIA - MÚLTIPLES CONFIGURACIONES
+# ============================================================================
+
+def get_config_file():
+    config_dir = Path.home() / '.comparador_directorios'
+    config_dir.mkdir(exist_ok=True, parents=True)
+    return config_dir / 'ssh_configs.json'
+
+
+def load_all_ssh_configs():
+    """Carga todas las configuraciones SSH guardadas"""
+    config_file = get_config_file()
+    default_structure = {
+        'configurations': [],
+        'last_used': None
+    }
+
+    if config_file.exists():
+        try:
+            with open(config_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                return data
+        except:
+            return default_structure
+    return default_structure
+
+
+def save_ssh_config(config_name, config):
+    """Guarda o actualiza una configuración SSH"""
+    config_file = get_config_file()
+    try:
+        data = load_all_ssh_configs()
+
+        # Buscar si la configuración ya existe
+        existing = next((i for i, c in enumerate(data['configurations']) if c['name'] == config_name), None)
+
+        new_config = {
+            'name': config_name,
+            'hostname': config.get('hostname', ''),
+            'username': config.get('username', ''),
+            'port': config.get('port', 22),
+            'key_file': config.get('key_file', ''),
+            'password': config.get('password', ''),
+            'auth_type': config.get('auth_type', 'key'),
+        }
+
+        if existing is not None:
+            data['configurations'][existing] = new_config
+        else:
+            data['configurations'].append(new_config)
+
+        data['last_used'] = config_name
+
+        with open(config_file, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception as e:
+        print(f"Error guardando config: {e}")
+        return False
+
+
+def delete_ssh_config(config_name):
+    """Borra una configuración SSH"""
+    config_file = get_config_file()
+    try:
+        data = load_all_ssh_configs()
+        data['configurations'] = [c for c in data['configurations'] if c['name'] != config_name]
+
+        if data['last_used'] == config_name:
+            data['last_used'] = data['configurations'][0]['name'] if data['configurations'] else None
+
+        with open(config_file, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        return True
+    except:
+        return False
+
+
+def clear_all_ssh_configs():
+    """Limpia todas las configuraciones SSH"""
+    config_file = get_config_file()
+    try:
+        if config_file.exists():
+            config_file.unlink()
+        return True
+    except:
+        return False
+
 
 try:
     import paramiko
@@ -26,15 +110,6 @@ try:
     PARAMIKO_AVAILABLE = True
 except ImportError:
     PARAMIKO_AVAILABLE = False
-
-try:
-    from cryptography.hazmat.primitives.asymmetric import rsa, dsa, ec, ed25519
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.backends import default_backend
-
-    CRYPTOGRAPHY_AVAILABLE = True
-except ImportError:
-    CRYPTOGRAPHY_AVAILABLE = False
 
 
 @dataclass
@@ -48,13 +123,11 @@ class FileInfo:
 
 class DirectoryComparator:
     def __init__(self, local_path: str, remote_path: str, ssh_config: Optional[Dict] = None):
-        # Manejar la ruta de forma más flexible
         local_path = local_path.strip()
 
-        # Detectar si es ruta de Windows
         is_windows_path = (
-                (len(local_path) >= 2 and local_path[1] == ':') or  # C:
-                local_path.startswith('\\\\')  # UNC path
+                (len(local_path) >= 2 and local_path[1] == ':') or
+                local_path.startswith('\\\\')
         )
 
         self.remote_path = remote_path.strip()
@@ -63,16 +136,9 @@ class DirectoryComparator:
         self.ssh_client = None
         self.is_remote = ssh_config is not None
 
-        # LÓGICA CLAVE:
-        # Si es ruta Windows + está marcado Remoto = NO validar localmente
-        # (la validación ocurrirá cuando se ejecute en la máquina Windows del usuario)
-
         if is_windows_path and self.is_remote:
-            # Confiar en que el usuario tiene la ruta correcta
-            # Se validará cuando Python ejecute en su máquina Windows
             self.local_path = Path(local_path).expanduser()
         else:
-            # Validación normal para rutas Linux
             test_path = Path(local_path).expanduser()
 
             if not test_path.exists():
@@ -83,16 +149,8 @@ class DirectoryComparator:
 
             self.local_path = test_path
 
-            # Validación solo para rutas Linux locales
             if not self.local_path.exists():
-                error_msg = f"❌ Directorio local no existe\n\n"
-                error_msg += f"Ruta proporcionada: {local_path}\n"
-                error_msg += f"Ruta expandida: {self.local_path}\n\n"
-                error_msg += f"💡 Verifica:\n"
-                error_msg += f"  • ¿La ruta existe?\n"
-                error_msg += f"  • ¿Tienes permisos de lectura?\n"
-                error_msg += f"  • En Linux: usa rutas absolutas (Ej: /home/user/carpeta)\n"
-                raise FileNotFoundError(error_msg)
+                raise FileNotFoundError(f"Directorio local no existe: {local_path}")
 
         if self.is_remote and PARAMIKO_AVAILABLE:
             self._connect_ssh()
@@ -103,468 +161,24 @@ class DirectoryComparator:
             self.ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
             connect_kwargs = {
-                'hostname': self.ssh_config['hostname'],
+                'hostname': self.ssh_config.get('hostname'),
                 'username': self.ssh_config.get('username', 'root'),
-                'port': self.ssh_config.get('port', 22),
+                'port': int(self.ssh_config.get('port', 22)),
                 'timeout': 10,
             }
 
-            if 'password' in self.ssh_config and self.ssh_config['password']:
+            if self.ssh_config.get('password'):
                 connect_kwargs['password'] = self.ssh_config['password']
-            elif 'key_file' in self.ssh_config and self.ssh_config['key_file']:
-                key_file = self.ssh_config['key_file']
-
-                # Convertir .ppk a OpenSSH si es necesario
-                key_file = self._handle_ppk_key(key_file)
-
-                connect_kwargs['key_filename'] = key_file
+            elif self.ssh_config.get('key_file'):
+                key_path = Path(self.ssh_config['key_file']).expanduser()
+                if not key_path.exists():
+                    raise FileNotFoundError(f"Clave no existe: {self.ssh_config['key_file']}")
+                connect_kwargs['key_filename'] = str(key_path)
 
             self.ssh_client.connect(**connect_kwargs)
             self.sftp_client = self.ssh_client.open_sftp()
         except Exception as e:
             raise ConnectionError(f"Error SSH: {str(e)}")
-
-    def _handle_ppk_key(self, key_file: str) -> str:
-        key_path = Path(key_file).expanduser()
-
-        if not key_path.exists():
-            raise FileNotFoundError(f"Archivo de clave no existe: {key_file}")
-
-        if not key_path.suffix.lower() == '.ppk':
-            return str(key_path)
-
-        import tempfile
-        import subprocess
-
-        # Metodo 1: Intentar con puttygen.exe (Windows)
-        try:
-            return self._convert_ppk_with_puttygen(key_path)
-        except Exception as e:
-            pass
-
-        # Metodo 2: Intentar con ssh-keygen
-        try:
-            return self._convert_ppk_with_ssh_keygen(key_path)
-        except Exception as e:
-            pass
-
-        # Metodo 3: Parser custom
-        try:
-            if CRYPTOGRAPHY_AVAILABLE:
-                return self._convert_ppk_custom_parser(key_path)
-        except Exception as e:
-            pass
-
-        raise ValueError(
-            f"No se puede procesar el archivo PPK automaticamente.\n"
-            f"El formato es demasiado complejo o no estándar.\n\n"
-            f"Solucion: Convierte manualmente con PuTTYgen (2 minutos):\n"
-            f"1. Abre PuTTYgen\n"
-            f"2. Load -> {key_path.name}\n"
-            f"3. Conversions -> Export OpenSSH key\n"
-            f"4. Guarda el archivo sin extension .ppk\n"
-            f"5. Usa la nueva ruta en el comparador\n\n"
-            f"PuTTYgen es 100% confiable para cualquier formato PPK."
-        )
-
-    def _convert_ppk_with_puttygen(self, key_path: Path) -> str:
-        import subprocess
-        import tempfile
-
-        temp_dir = Path(tempfile.gettempdir())
-        output_file = temp_dir / f"{key_path.stem}_openssh_{os.getpid()}"
-
-        puttygen_paths = [
-            "puttygen.exe",
-            "C:\\Program Files\\PuTTY\\puttygen.exe",
-            "C:\\Program Files (x86)\\PuTTY\\puttygen.exe",
-            str(Path.home() / "AppData" / "Local" / "Programs" / "PuTTY" / "puttygen.exe"),
-        ]
-
-        puttygen_exe = None
-        for path in puttygen_paths:
-            if Path(path).exists():
-                puttygen_exe = path
-                break
-
-        if not puttygen_exe:
-            try:
-                result = subprocess.run(
-                    ["where", "puttygen"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5
-                )
-                if result.returncode == 0:
-                    puttygen_exe = result.stdout.strip().split('\n')[0]
-            except:
-                pass
-
-        if not puttygen_exe:
-            raise RuntimeError("puttygen.exe no encontrado")
-
-        try:
-            result = subprocess.run(
-                [puttygen_exe, "-i", str(key_path), "-O", "private-openssh", "-o", str(output_file)],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-
-            if result.returncode == 0 and output_file.exists():
-                output_file.chmod(0o600)
-                return str(output_file)
-            else:
-                raise RuntimeError(f"puttygen fallo: {result.stderr}")
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("puttygen timeout")
-
-    def _convert_ppk_with_ssh_keygen(self, key_path: Path) -> str:
-        import subprocess
-        import tempfile
-
-        temp_dir = Path(tempfile.gettempdir())
-        output_file = temp_dir / f"{key_path.stem}_openssh_{os.getpid()}"
-
-        try:
-            result = subprocess.run(
-                ["ssh-keygen", "-i", "-f", str(key_path), "-m", "pem"],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-
-            if result.returncode == 0:
-                with open(output_file, 'w') as f:
-                    f.write(result.stdout)
-                output_file.chmod(0o600)
-                return str(output_file)
-            else:
-                raise RuntimeError(f"ssh-keygen fallo: {result.stderr}")
-        except FileNotFoundError:
-            raise RuntimeError("ssh-keygen no encontrado")
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("ssh-keygen timeout")
-
-    def _convert_ppk_custom_parser(self, key_path: Path) -> str:
-        import io
-        import base64
-        import tempfile
-
-        with open(key_path, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
-
-        lines = content.split('\n')
-        public_blob, private_blob = self._extract_ppk_sections_from_lines(lines)
-
-        if not private_blob:
-            raise ValueError("No se encontro Private-Lines")
-
-        stream = io.BytesIO(private_blob)
-        key_data = self._parse_ppk_blob_robusto(stream)
-
-        if key_data['type'] == 'rsa':
-            openssh_bytes = self._generate_openssh_rsa(key_data)
-        elif key_data['type'] == 'dsa':
-            openssh_bytes = self._generate_openssh_dsa(key_data)
-        elif key_data['type'] == 'ecdsa':
-            openssh_bytes = self._generate_openssh_ecdsa(key_data)
-        elif key_data['type'] == 'ed25519':
-            openssh_bytes = self._generate_openssh_ed25519(key_data)
-        else:
-            raise ValueError(f"Tipo no soportado: {key_data['type']}")
-
-        temp_dir = Path(tempfile.gettempdir())
-        output_file = temp_dir / f"{key_path.stem}_openssh_{os.getpid()}"
-
-        with open(output_file, 'wb') as f:
-            f.write(openssh_bytes)
-
-        output_file.chmod(0o600)
-        return str(output_file)
-
-    def _extract_ppk_sections_from_lines(self, lines) -> tuple:
-        import base64
-
-        public_blob = None
-        private_blob = None
-
-        i = 0
-        while i < len(lines):
-            line = lines[i].strip()
-
-            if line.startswith('Public-Lines:'):
-                try:
-                    count = int(line.split(':')[1].strip())
-                    i += 1
-                    public_lines = []
-                    for j in range(count):
-                        if i < len(lines):
-                            public_lines.append(lines[i].strip())
-                            i += 1
-                    public_blob = base64.b64decode(''.join(public_lines))
-                    continue
-                except:
-                    i += 1
-                    continue
-
-            if line.startswith('Private-Lines:'):
-                try:
-                    count = int(line.split(':')[1].strip())
-                    i += 1
-                    private_lines = []
-                    for j in range(count):
-                        if i < len(lines):
-                            private_lines.append(lines[i].strip())
-                            i += 1
-                    private_blob = base64.b64decode(''.join(private_lines))
-                    continue
-                except:
-                    i += 1
-                    continue
-
-            i += 1
-
-        return public_blob, private_blob
-
-    def _extract_ppk_sections(self, key_path: Path) -> tuple:
-        import base64
-
-        with open(key_path, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
-
-        lines = content.split('\n')
-        public_blob = None
-        private_blob = None
-
-        i = 0
-        while i < len(lines):
-            line = lines[i].strip()
-
-            if line.startswith('Public-Lines:'):
-                try:
-                    count = int(line.split(':')[1].strip())
-                    i += 1
-                    public_lines = []
-                    for j in range(count):
-                        if i < len(lines):
-                            public_lines.append(lines[i].strip())
-                            i += 1
-                        else:
-                            break
-
-                    blob_b64 = ''.join(public_lines)
-                    public_blob = base64.b64decode(blob_b64)
-                    continue
-                except Exception:
-                    i += 1
-                    continue
-
-            if line.startswith('Private-Lines:'):
-                try:
-                    count = int(line.split(':')[1].strip())
-                    i += 1
-                    private_lines = []
-                    for j in range(count):
-                        if i < len(lines):
-                            private_lines.append(lines[i].strip())
-                            i += 1
-                        else:
-                            break
-
-                    blob_b64 = ''.join(private_lines)
-                    private_blob = base64.b64decode(blob_b64)
-                    continue
-                except Exception:
-                    i += 1
-                    continue
-
-            i += 1
-
-        return public_blob, private_blob
-
-    def _read_string_robusto(self, stream, max_len: int = 10000000) -> bytes:
-        length_bytes = stream.read(4)
-        if len(length_bytes) < 4:
-            raise ValueError("No hay suficientes bytes para longitud")
-
-        length = int.from_bytes(length_bytes, 'big')
-
-        if length > max_len or length < 0:
-            raise ValueError(f"Longitud invalida: {length}")
-
-        data = stream.read(length)
-        if len(data) < length:
-            raise ValueError(f"Stream truncado: esperaba {length}, obtuvo {len(data)}")
-
-        return data
-
-    def _parse_ppk_blob_robusto(self, stream) -> dict:
-        try:
-            key_type = self._read_string_robusto(stream)
-
-            if b'ssh-rsa' in key_type or b'rsa' in key_type.lower():
-                return self._parse_ppk_rsa_key(stream)
-            elif b'dss' in key_type.lower() or b'dsa' in key_type.lower():
-                return self._parse_ppk_dsa_key(stream)
-            elif b'ecdsa' in key_type.lower():
-                return self._parse_ppk_ecdsa_key(stream)
-            elif b'ed25519' in key_type.lower():
-                return self._parse_ppk_ed25519_key(stream)
-            else:
-                stream.seek(0)
-                return self._parse_ppk_rsa_key(stream)
-
-        except Exception as e:
-            raise ValueError(f"Error parseando blob PPK: {str(e)}")
-
-    def _parse_ppk_rsa_key(self, stream) -> dict:
-        try:
-            key_type = self._read_string_robusto(stream)
-            e = self._read_string_robusto(stream)
-            d = self._read_string_robusto(stream)
-            n = self._read_string_robusto(stream)
-            p = self._read_string_robusto(stream)
-            q = self._read_string_robusto(stream)
-
-            return {
-                'type': 'rsa',
-                'e': int.from_bytes(e, 'big'),
-                'd': int.from_bytes(d, 'big'),
-                'n': int.from_bytes(n, 'big'),
-                'p': int.from_bytes(p, 'big'),
-                'q': int.from_bytes(q, 'big')
-            }
-        except Exception as e:
-            raise ValueError(f"Error parseando RSA: {str(e)}")
-
-    def _parse_ppk_dsa_key(self, stream) -> dict:
-        try:
-            key_type = self._read_string_robusto(stream)
-            p = self._read_string_robusto(stream)
-            q = self._read_string_robusto(stream)
-            g = self._read_string_robusto(stream)
-            y = self._read_string_robusto(stream)
-            x = self._read_string_robusto(stream)
-
-            return {
-                'type': 'dsa',
-                'p': int.from_bytes(p, 'big'),
-                'q': int.from_bytes(q, 'big'),
-                'g': int.from_bytes(g, 'big'),
-                'y': int.from_bytes(y, 'big'),
-                'x': int.from_bytes(x, 'big')
-            }
-        except Exception as e:
-            raise ValueError(f"Error parseando DSA: {str(e)}")
-
-    def _parse_ppk_ecdsa_key(self, stream) -> dict:
-        try:
-            key_type = self._read_string_robusto(stream)
-            curve_name = self._read_string_robusto(stream)
-            point_data = self._read_string_robusto(stream)
-            d = self._read_string_robusto(stream)
-
-            return {
-                'type': 'ecdsa',
-                'curve': curve_name.decode('utf-8', errors='ignore'),
-                'point': point_data,
-                'd': int.from_bytes(d, 'big')
-            }
-        except Exception as e:
-            raise ValueError(f"Error parseando ECDSA: {str(e)}")
-
-    def _parse_ppk_ed25519_key(self, stream) -> dict:
-        try:
-            key_type = self._read_string_robusto(stream)
-            public = self._read_string_robusto(stream)
-            private_seed = self._read_string_robusto(stream)
-
-            if len(private_seed) >= 32:
-                private_seed = private_seed[:32]
-
-            return {
-                'type': 'ed25519',
-                'public': public,
-                'private': private_seed
-            }
-        except Exception as e:
-            raise ValueError(f"Error parseando Ed25519: {str(e)}")
-
-    def _generate_openssh_rsa(self, key_data: dict) -> bytes:
-        try:
-            e = key_data['e']
-            d = key_data['d']
-            n = key_data['n']
-            p = key_data['p']
-            q = key_data['q']
-
-            dmp1 = d % (p - 1)
-            dmq1 = d % (q - 1)
-            iqmp = pow(q, -1, p)
-
-            public_numbers = rsa.RSAPublicNumbers(e, n)
-            private_numbers = rsa.RSAPrivateNumbers(p, q, d, dmp1, dmq1, iqmp, public_numbers)
-            private_key = private_numbers.private_key(default_backend())
-
-            return private_key.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.OpenSSH,
-                encryption_algorithm=serialization.NoEncryption()
-            )
-
-        except Exception as e:
-            raise ValueError(f"Error generando OpenSSH RSA: {str(e)}")
-
-    def _generate_openssh_dsa(self, key_data: dict) -> bytes:
-        try:
-            parameter_numbers = dsa.DSAParameterNumbers(key_data['p'], key_data['q'], key_data['g'])
-            public_numbers = dsa.DSAPublicNumbers(key_data['y'], parameter_numbers)
-            private_numbers = dsa.DSAPrivateNumbers(key_data['x'], public_numbers)
-            private_key = private_numbers.private_key(default_backend())
-
-            return private_key.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.OpenSSH,
-                encryption_algorithm=serialization.NoEncryption()
-            )
-        except Exception as e:
-            raise ValueError(f"Error generando OpenSSH DSA: {str(e)}")
-
-    def _generate_openssh_ecdsa(self, key_data: dict) -> bytes:
-        try:
-            curve_name = key_data['curve']
-
-            if b'256' in curve_name.encode() or b'nistp256' in curve_name.encode():
-                curve = ec.SECP256R1()
-            elif b'384' in curve_name.encode() or b'nistp384' in curve_name.encode():
-                curve = ec.SECP384R1()
-            elif b'521' in curve_name.encode() or b'nistp521' in curve_name.encode():
-                curve = ec.SECP521R1()
-            else:
-                curve = ec.SECP256R1()
-
-            private_key = ec.derive_private_key(key_data['d'], curve, default_backend())
-
-            return private_key.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.OpenSSH,
-                encryption_algorithm=serialization.NoEncryption()
-            )
-        except Exception as e:
-            raise ValueError(f"Error generando OpenSSH ECDSA: {str(e)}")
-
-    def _generate_openssh_ed25519(self, key_data: dict) -> bytes:
-        try:
-            private_key = ed25519.Ed25519PrivateKey.from_private_bytes(key_data['private'])
-
-            return private_key.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.OpenSSH,
-                encryption_algorithm=serialization.NoEncryption()
-            )
-        except Exception as e:
-            raise ValueError(f"Error generando OpenSSH Ed25519: {str(e)}")
 
     def _get_local_files(self) -> Dict[str, FileInfo]:
         files = {}
@@ -597,7 +211,6 @@ class DirectoryComparator:
                             item_path = f"{path}/{item.filename}".replace('\\', '/')
                             rel_path = f"{prefix}{item.filename}".lstrip('/')
 
-                            # Verificar si es directorio
                             try:
                                 self.sftp_client.stat(item_path)
                                 if item.filename.count('.') == 0:
@@ -613,20 +226,17 @@ class DirectoryComparator:
                                 local_exists=False,
                                 remote_exists=True
                             )
-                    except Exception as e:
-                        print(f"Error en walk_sftp: {e}")
+                    except:
+                        pass
 
                 walk_sftp(self.remote_path)
             except Exception as e:
                 raise Exception(f"Error leyendo remoto: {str(e)}")
         else:
-            # Directorio local simulando remoto
             try:
                 remote_base = Path(self.remote_path).expanduser()
-
                 if not remote_base.exists():
                     raise FileNotFoundError(f"Directorio remoto no existe: {self.remote_path}")
-
                 for file_path in remote_base.rglob('*'):
                     if file_path.is_file():
                         rel_path = file_path.relative_to(remote_base).as_posix()
@@ -637,8 +247,6 @@ class DirectoryComparator:
                             local_exists=False,
                             remote_exists=True
                         )
-            except FileNotFoundError:
-                raise
             except Exception as e:
                 raise Exception(f"Error leyendo remoto: {str(e)}")
 
@@ -694,10 +302,22 @@ class DirectoryComparator:
             except Exception as e:
                 return f"[Error: {e}]"
 
+    def _extract_php_keys(self, content_str: str) -> list:
+        """Extrae las claves/etiquetas de un archivo que retorna un array asociativo en PHP"""
+        pattern = r"['\"]([^'\"]+)['\"]\s*=>"
+        return re.findall(pattern, content_str)
+
+    def _extract_single_line_key(self, line_text: str) -> Optional[str]:
+        """Extrae la clave de una única línea PHP tipo 'key' => 'value'"""
+        txt = line_text.strip()
+        if '=>' not in txt:
+            return None
+        key_part = txt.split('=>')[0].strip()
+        return key_part.replace("'", "").replace('"', "")
+
     def compare(self) -> Dict[str, FileInfo]:
         local_files = self._get_local_files()
         remote_files = self._get_remote_files()
-
         all_files = {**local_files, **remote_files}
 
         for rel_path in all_files:
@@ -725,27 +345,40 @@ class DirectoryComparator:
 
         return all_files
 
-    def get_diff(self, rel_path: str) -> str:
-        """Formato unificado (deprecated, usa get_diff_side_by_side)"""
-        local_content = self._read_local_file(rel_path).splitlines(keepends=True)
-        remote_content = self._read_remote_file(rel_path).splitlines(keepends=True)
-
-        diff = difflib.unified_diff(
-            remote_content,
-            local_content,
-            fromfile=f"remoto: {rel_path}",
-            tofile=f"local: {rel_path}",
-            lineterm=''
-        )
-
-        return '\n'.join(diff)
-
     def get_diff_side_by_side(self, rel_path: str) -> Dict:
-        """Genera diff lado a lado para mejor visualización"""
-        local_content = self._read_local_file(rel_path).splitlines()
-        remote_content = self._read_remote_file(rel_path).splitlines()
+        local_raw = self._read_local_file(rel_path)
+        remote_raw = self._read_remote_file(rel_path)
 
-        # Usar SequenceMatcher para alineación
+        local_content = local_raw.splitlines()
+        remote_content = remote_raw.splitlines()
+
+        # ---------------------------------------------------------------------
+        # ANÁLISIS INCISIVO DE ETIQUETAS
+        # ---------------------------------------------------------------------
+        is_php = rel_path.endswith('.php')
+        tags_match_msg = ""
+
+        if is_php:
+            local_keys = self._extract_php_keys(local_raw)
+            remote_keys = self._extract_php_keys(remote_raw)
+
+            if local_keys == remote_keys:
+                tags_match_msg = " [ESTRUCTURA DE ETIQUETAS IDÉNTICA]"
+            else:
+                missing_in_local = set(remote_keys) - set(local_keys)
+                missing_in_remote = set(local_keys) - set(remote_keys)
+                error_details = []
+                if missing_in_local:
+                    error_details.append(f"Faltan en Ruta 1: {list(missing_in_local)}")
+                if missing_in_remote:
+                    error_details.append(f"Faltan en Ruta 2: {list(missing_in_remote)}")
+
+                if len(local_keys) == len(remote_keys):
+                    tags_match_msg = " [⚠ ALERTA: Mismo número de elementos pero LAS ETIQUETAS DIFIEREN o están desordenadas]"
+                else:
+                    tags_match_msg = f" [❌ ERROR DE ETIQUETAS: {', '.join(error_details)}]"
+        # ---------------------------------------------------------------------
+
         matcher = difflib.SequenceMatcher(None, remote_content, local_content)
         opcodes = matcher.get_opcodes()
 
@@ -755,7 +388,6 @@ class DirectoryComparator:
 
         for tag, i1, i2, j1, j2 in opcodes:
             if tag == 'equal':
-                # Lineas iguales
                 for i in range(i2 - i1):
                     side_by_side.append({
                         'type': 'equal',
@@ -768,14 +400,21 @@ class DirectoryComparator:
                     local_line_num += 1
 
             elif tag == 'replace':
-                # Lineas modificadas
                 max_lines = max(i2 - i1, j2 - j1)
                 for i in range(max_lines):
                     remote_text = remote_content[i1 + i] if i1 + i < i2 else ''
                     local_text = local_content[j1 + i] if j1 + i < j2 else ''
 
+                    line_row_type = 'replace'
+                    if is_php and remote_text and local_text:
+                        rem_key = self._extract_single_line_key(remote_text)
+                        loc_key = self._extract_single_line_key(local_text)
+
+                        if rem_key and loc_key and rem_key == loc_key:
+                            line_row_type = 'replace-only-value'
+
                     side_by_side.append({
-                        'type': 'replace',
+                        'type': line_row_type,
                         'remote_line': remote_line_num if i1 + i < i2 else None,
                         'remote_text': remote_text,
                         'local_line': local_line_num if j1 + i < j2 else None,
@@ -788,7 +427,6 @@ class DirectoryComparator:
                         local_line_num += 1
 
             elif tag == 'delete':
-                # Lineas eliminadas (solo en remoto)
                 for i in range(i1, i2):
                     side_by_side.append({
                         'type': 'delete',
@@ -800,7 +438,6 @@ class DirectoryComparator:
                     remote_line_num += 1
 
             elif tag == 'insert':
-                # Lineas insertadas (solo en local)
                 for i in range(j1, j2):
                     side_by_side.append({
                         'type': 'insert',
@@ -812,7 +449,7 @@ class DirectoryComparator:
                     local_line_num += 1
 
         return {
-            'path': rel_path,
+            'path': rel_path + tags_match_msg,
             'total_lines': max(len(remote_content), len(local_content)),
             'remote_lines': len(remote_content),
             'local_lines': len(local_content),
@@ -833,7 +470,6 @@ class DirectoryComparator:
 
 
 class ComparatorWebHandler(BaseHTTPRequestHandler):
-    # Variables de clase compartidas
     current_comparator = None
     current_results = None
     current_info = {}
@@ -856,9 +492,45 @@ class ComparatorWebHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(content_length).decode('utf-8')
 
         try:
-            data = json.loads(body)
+            data = json.loads(body) if body else {}
 
-            if 'action' in data and data['action'] == 'compare':
+            if self.path == '/api/save_config':
+                config_name = data.get('config_name', '').strip()
+                if not config_name:
+                    self.send_json_response({'error': 'Nombre de configuración requerido'}, 400)
+                    return
+
+                config = {
+                    'hostname': data.get('hostname', ''),
+                    'username': data.get('username', ''),
+                    'port': int(data.get('port', 22)),
+                    'key_file': data.get('key_file', ''),
+                    'password': data.get('password', ''),
+                    'auth_type': data.get('auth_type', 'key'),
+                }
+                if save_ssh_config(config_name, config):
+                    self.send_json_response({'status': 'saved', 'config_name': config_name})
+                else:
+                    self.send_json_response({'error': 'No se pudo guardar'}, 500)
+
+            elif self.path == '/api/delete_config':
+                config_name = data.get('config_name', '').strip()
+                if delete_ssh_config(config_name):
+                    self.send_json_response({'status': 'deleted'})
+                else:
+                    self.send_json_response({'error': 'No se pudo borrar'}, 500)
+
+            elif self.path == '/api/load_all_configs':
+                all_configs = load_all_ssh_configs()
+                self.send_json_response(all_configs)
+
+            elif self.path == '/api/clear_all_configs':
+                if clear_all_ssh_configs():
+                    self.send_json_response({'status': 'cleared'})
+                else:
+                    self.send_json_response({'error': 'No se pudo limpiar'}, 500)
+
+            elif 'action' in data and data['action'] == 'compare':
                 result = self.handle_compare(data)
                 self.send_json_response(result)
             else:
@@ -867,7 +539,6 @@ class ComparatorWebHandler(BaseHTTPRequestHandler):
             self.send_json_response({'error': str(e)}, 400)
 
     def handle_compare(self, data):
-        """Maneja la solicitud de comparación"""
         try:
             local_path = data.get('local_path', '').strip()
             remote_path = data.get('remote_path', '').strip()
@@ -876,7 +547,6 @@ class ComparatorWebHandler(BaseHTTPRequestHandler):
             if not local_path or not remote_path:
                 return {'error': 'Las rutas son requeridas'}
 
-            # Cerrar comparador anterior si existe
             if self.__class__.current_comparator:
                 self.__class__.current_comparator.close()
 
@@ -900,24 +570,14 @@ class ComparatorWebHandler(BaseHTTPRequestHandler):
                     'port': ssh_port,
                 }
 
-                # Intentar autenticación en este orden:
-                # 1. Contraseña (si la proporciona)
-                # 2. Clave SSH (si la proporciona)
-                # 3. Sin autenticación explícita (ssh-agent o clave por defecto en ~/.ssh/)
-
                 if ssh_password:
                     ssh_config['password'] = ssh_password
                 elif ssh_key:
                     ssh_config['key_file'] = ssh_key
-                # Si no proporciona ni contraseña ni clave, paramiko intentará con ssh-agent
 
-            # Crear comparador
             comparator = DirectoryComparator(local_path, remote_path, ssh_config)
-
-            # Ejecutar comparación
             results = comparator.compare()
 
-            # Guardar datos
             self.__class__.current_comparator = comparator
             self.__class__.current_results = results
             self.__class__.current_info = {
@@ -928,7 +588,6 @@ class ComparatorWebHandler(BaseHTTPRequestHandler):
                 'total_files': len(results),
             }
 
-            # Calcular estadísticas
             stats = {
                 'total': len(results),
                 'identical': len([i for i in results.values() if i.status == 'idéntico']),
@@ -944,10 +603,11 @@ class ComparatorWebHandler(BaseHTTPRequestHandler):
             }
 
         except Exception as e:
-            return {'error': f'Error: {str(e)}', 'traceback': traceback.format_exc()}
+            return {'error': f'Error: {str(e)}'}
 
     def serve_home(self):
-        html = self.get_html()
+        all_configs = load_all_ssh_configs()
+        html = self.get_html(all_configs)
         self.send_response(200)
         self.send_header('Content-type', 'text/html; charset=utf-8')
         self.end_headers()
@@ -972,6 +632,8 @@ class ComparatorWebHandler(BaseHTTPRequestHandler):
             return
 
         try:
+            from urllib.parse import unquote
+            rel_path = unquote(rel_path)
             diff_data = self.__class__.current_comparator.get_diff_side_by_side(rel_path)
             self.send_json_response(diff_data)
         except Exception as e:
@@ -983,862 +645,523 @@ class ComparatorWebHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(data, ensure_ascii=False).encode('utf-8'))
 
-    def get_html(self):
-        return """
+    def get_html(self, all_configs):
+        configs_json = json.dumps(all_configs, ensure_ascii=False)
+
+        return f"""
 <!DOCTYPE html>
 <html lang="es">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Comparador de Directorios</title>
+    <title>Comparador de Directorios v4.2</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { 
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{ 
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
             background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%);
             min-height: 100vh;
             padding: 20px;
-        }
-        .container { 
-            max-width: 1200px; 
-            margin: 0 auto;
-        }
-        .card {
+        }}
+        .container {{ max-width: 1100px; margin: 0 auto; }}
+        .card {{
             background: white;
             border-radius: 12px;
             box-shadow: 0 10px 40px rgba(0,0,0,0.2);
             padding: 30px;
             margin-bottom: 20px;
-        }
-        h1 { 
-            color: white;
-            margin-bottom: 30px;
-            font-size: 32px;
-            text-shadow: 0 2px 4px rgba(0,0,0,0.2);
-        }
-        .form-section {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 20px;
-            margin-bottom: 20px;
-        }
-        .form-group {
-            display: flex;
-            flex-direction: column;
-        }
-        label {
-            font-weight: 600;
-            color: #333;
-            margin-bottom: 8px;
-            font-size: 14px;
-        }
-        input[type="text"], input[type="password"], select {
-            padding: 12px;
-            border: 2px solid #e0e0e0;
-            border-radius: 6px;
-            font-size: 14px;
-            transition: all 0.3s;
-            font-family: inherit;
-        }
-        input[type="text"]:focus, input[type="password"]:focus, select:focus {
-            outline: none;
-            border-color: #e74c3c;
-            box-shadow: 0 0 0 3px rgba(231, 76, 60, 0.1);
-        }
-        .checkbox-group {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        input[type="checkbox"] {
-            width: 18px;
-            height: 18px;
-            cursor: pointer;
-        }
-        .ssh-config {
-            display: none;
-            grid-column: 1 / -1;
-            padding: 20px;
-            background: #f5f5f5;
-            border-radius: 6px;
-            grid-template-columns: repeat(2, 1fr);
-            gap: 20px;
-        }
-        .ssh-config.visible {
-            display: grid;
-        }
-        .ssh-config .form-group {
-            margin: 0;
-        }
-        .button-group {
-            display: flex;
-            gap: 10px;
-            grid-column: 1 / -1;
-        }
-        button {
-            padding: 12px 24px;
-            border: none;
-            border-radius: 6px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.3s;
-            font-size: 14px;
-        }
-        .btn-primary {
-            background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%);
-            color: white;
-            flex: 1;
-        }
-        .btn-primary:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 20px rgba(231, 76, 60, 0.4);
-        }
-        .btn-primary:disabled {
-            opacity: 0.6;
-            cursor: not-allowed;
-            transform: none;
-        }
-        .btn-reset {
-            background: #f0f0f0;
-            color: #333;
-        }
-        .btn-reset:hover {
-            background: #e0e0e0;
-        }
-        .status {
-            padding: 12px;
-            border-radius: 6px;
-            margin-bottom: 20px;
-            display: none;
-        }
-        .status.show {
-            display: block;
-        }
-        .status.success {
-            background: #e8f5e9;
-            color: #2e7d32;
-            border: 1px solid #4caf50;
-        }
-        .status.error {
-            background: #ffebee;
-            color: #c62828;
-            border: 1px solid #f44336;
-        }
-        .status.loading {
-            background: #ffe8e6;
-            color: #c0392b;
-            border: 1px solid #e74c3c;
-        }
-        .spinner {
-            display: inline-block;
-            width: 14px;
-            height: 14px;
-            border: 2px solid #e74c3c;
-            border-top-color: transparent;
-            border-radius: 50%;
-            animation: spin 0.8s linear infinite;
-            margin-right: 8px;
-        }
-        @keyframes spin { to { transform: rotate(360deg); } }
-
-        .stats {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            gap: 15px;
-            margin-bottom: 20px;
-        }
-        .stat-card {
-            background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%);
-            color: white;
-            padding: 15px;
-            border-radius: 8px;
-            text-align: center;
-        }
-        .stat-value {
-            font-size: 28px;
-            font-weight: bold;
-        }
-        .stat-label {
-            font-size: 12px;
-            opacity: 0.9;
-            margin-top: 5px;
-        }
-
-        .filter-buttons {
-            display: flex;
-            gap: 10px;
-            margin-bottom: 20px;
-            flex-wrap: wrap;
-        }
-        .filter-btn {
-            padding: 8px 16px;
-            border: 2px solid #ddd;
-            background: white;
-            border-radius: 4px;
-            cursor: pointer;
-            transition: all 0.2s;
-            font-weight: 500;
-        }
-        .filter-btn.active {
-            background: #e74c3c;
-            color: white;
-            border-color: #e74c3c;
-        }
-        .filter-btn:hover {
-            border-color: #e74c3c;
-        }
-
-        .file-list {
-            display: grid;
-            gap: 10px;
-            max-height: 600px;
-            overflow-y: auto;
-        }
-        .file-item {
-            background: #f9f9f9;
-            padding: 12px;
-            border-radius: 6px;
-            cursor: pointer;
-            transition: all 0.2s;
-            border-left: 4px solid transparent;
-        }
-        .file-item:hover {
-            background: #f0f0f0;
-            border-left-color: #e74c3c;
-        }
-        .file-item.selected {
-            background: #ffe8e6;
-            border-left-color: #e74c3c;
-        }
-        .file-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .file-name {
-            font-weight: 500;
-            color: #333;
-            word-break: break-all;
-            flex: 1;
-        }
-        .file-status {
-            padding: 4px 8px;
-            border-radius: 3px;
-            font-size: 11px;
-            font-weight: 600;
-            white-space: nowrap;
-            margin-left: 10px;
-        }
-        .status-idéntico { background: #e8f5e9; color: #2e7d32; }
-        .status-contenido_diferente { background: #fff3cd; color: #856404; }
-        .status-falta_en_remoto { background: #f8d7da; color: #721c24; }
-        .status-falta_en_local { background: #d1ecf1; color: #0c5460; }
-
-        .details {
-            display: none;
-        }
-        .details.show {
-            display: block;
-        }
-        .detail-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 15px;
-            padding-bottom: 15px;
-            border-bottom: 1px solid #e0e0e0;
-        }
-        .detail-header h3 {
-            color: #333;
-        }
-        .close-detail {
-            background: #f0f0f0;
-            color: #333;
-            padding: 8px 16px;
-            border-radius: 4px;
-            cursor: pointer;
-        }
-        .close-detail:hover {
-            background: #e0e0e0;
-        }
-
-        .diff-container {
-            background: #f5f5f5;
-            padding: 15px;
-            border-radius: 6px;
-            max-height: 700px;
-            overflow: auto;
-            font-family: 'Courier New', monospace;
-            font-size: 12px;
-            line-height: 1.5;
-        }
-
-        /* Vista lado a lado */
-        .diff-table {
-            width: 100%;
-            border-collapse: collapse;
-            background: white;
-        }
-
-        .diff-table tbody tr {
-            border-bottom: 1px solid #e0e0e0;
-        }
-
-        .diff-table tbody tr:hover {
-            background: #f9f9f9;
-        }
-
-        .diff-table td {
-            padding: 0;
-            width: 50%;
-            vertical-align: top;
-        }
-
-        .diff-line-num {
-            background: #f0f0f0;
-            color: #999;
-            padding: 4px 8px;
-            text-align: right;
-            width: 40px;
-            user-select: none;
-            border-right: 1px solid #ddd;
-            font-size: 11px;
-            flex-shrink: 0;
-        }
-
-        .diff-line-content {
-            padding: 4px 8px;
-            white-space: pre-wrap;
-            word-break: break-word;
-            flex: 1;
-            overflow-x: auto;
-        }
-
-        .diff-remote {
-            border-left: 3px solid #ffcdd2;
-            border-right: 1px solid #e0e0e0;
-        }
-
-        .diff-local {
-            border-left: 3px solid #c8e6c9;
-        }
-
-        .diff-equal .diff-line-content {
-            background: #fafafa;
-            color: #333;
-        }
-
-        .diff-delete .diff-line-content {
-            background: #ffebee;
-            color: #c62828;
-        }
-
-        .diff-insert .diff-line-content {
-            background: #e8f5e9;
-            color: #2e7d32;
-        }
-
-        .diff-replace-remote {
-            background: #ffe0b2 !important;
-            color: #e65100 !important;
-        }
-
-        .diff-replace-local {
-            background: #bbdefb !important;
-            color: #0d47a1 !important;
-        }
-
-        .diff-header-row {
-            background: #e3f2fd;
-            font-weight: bold;
-            padding: 10px;
-            text-align: center;
-            color: #0066cc;
-            border-bottom: 2px solid #0066cc;
-        }
-
-        .diff-header-container {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 0;
-            margin-bottom: 15px;
-            border: 1px solid #0066cc;
-            border-radius: 4px 4px 0 0;
-            overflow: hidden;
-        }
-
-        .diff-column-header {
-            padding: 12px;
-            background: #e3f2fd;
-            color: #0066cc;
-            font-weight: bold;
-            text-align: center;
-            border-right: 1px solid #0066cc;
-        }
-
-        .diff-column-header:last-child {
-            border-right: none;
-        }
-
-        .diff-stats {
-            background: #f5f5f5;
-            padding: 12px;
-            border-radius: 6px;
-            margin-bottom: 15px;
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 10px;
-            font-size: 12px;
-        }
-
-        .diff-stats-item {
-            padding: 8px;
-            background: white;
-            border-radius: 4px;
-            border-left: 3px solid #0066cc;
-        }
-
-        .diff-line {
-            white-space: pre-wrap;
-            word-break: break-all;
-        }
-
-        .diff-line.diff-add { background: #e8f5e9; color: #2e7d32; padding: 2px 4px; }
-        .diff-line.diff-remove { background: #ffebee; color: #c62828; padding: 2px 4px; }
-        .diff-line.diff-context { color: #666; }
-        .diff-line.diff-header { color: #0066cc; font-weight: bold; }
-
-        .empty-state {
-            text-align: center;
-            padding: 40px;
-            color: #999;
-        }
-        .empty-state-icon {
-            font-size: 48px;
-            margin-bottom: 10px;
-        }
-
-        @media (max-width: 768px) {
-            .form-section {
-                grid-template-columns: 1fr;
-            }
-            .ssh-config {
-                grid-template-columns: 1fr !important;
-            }
-            h1 { font-size: 24px; }
-            .card { padding: 20px; }
-        }
+        }}
+        h1 {{ color: white; margin-bottom: 10px; font-size: 32px; text-shadow: 0 2px 4px rgba(0,0,0,0.2); }}
+        .subtitle {{ color: rgba(255,255,255,0.8); font-size: 14px; margin-bottom: 30px; }}
+        h2 {{ color: #333; margin-bottom: 20px; font-size: 18px; }}
+        .section-title {{ color: #e74c3c; font-weight: bold; padding: 10px; background: #f5f5f5; border-left: 4px solid #e74c3c; margin-bottom: 15px; }}
+        .form-section {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }}
+        .form-group {{ display: flex; flex-direction: column; }}
+        label {{ font-weight: 600; color: #333; margin-bottom: 8px; font-size: 14px; }}
+        input, select {{ padding: 12px; border: 2px solid #e0e0e0; border-radius: 6px; font-size: 14px; font-family: monospace; }}
+        input:focus, select:focus {{ outline: none; border-color: #e74c3c; box-shadow: 0 0 0 3px rgba(231, 76, 60, 0.1); }}
+        .button-group {{ display: flex; gap: 10px; flex-wrap: wrap; margin-top: 20px; }}
+        button {{ padding: 12px 20px; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 14px; transition: all 0.3s; }}
+        .btn-primary {{ background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%); color: white; flex: 1; min-width: 150px; }}
+        .btn-primary:hover {{ transform: translateY(-2px); box-shadow: 0 5px 20px rgba(231, 76, 60, 0.4); }}
+        .btn-secondary {{ background: #3498db; color: white; }}
+        .btn-secondary:hover {{ background: #2980b9; }}
+        .btn-success {{ background: #27ae60; color: white; }}
+        .btn-success:hover {{ background: #229954; }}
+        .btn-danger {{ background: #95a5a6; color: white; }}
+        .btn-danger:hover {{ background: #7f8c8d; }}
+        .btn-small {{ padding: 8px 12px; font-size: 12px; min-width: auto; }}
+        .status {{ padding: 12px; border-radius: 6px; margin-top: 15px; display: none; }}
+        .status.show {{ display: block; }}
+        .status.success {{ background: #d5f4e6; color: #27ae60; border: 1px solid #27ae60; }}
+        .status.error {{ background: #fadbd8; color: #c0392b; border: 1px solid #c0392b; }}
+        .status.loading {{ background: #ffe8e6; color: #c0392b; }}
+        .info-box {{ background: #e3f2fd; border-left: 4px solid #2196f3; padding: 12px; margin: 15px 0; border-radius: 4px; font-size: 13px; color: #1565c0; }}
+        .config-selector {{ background: #f9f9f9; padding: 15px; border-radius: 6px; margin-bottom: 15px; }}
+        .config-row {{ display: grid; grid-template-columns: 1fr auto auto; gap: 10px; align-items: center; margin-bottom: 10px; }}
+        .config-name {{ font-weight: 500; color: #333; }}
+        .stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin: 20px 0; }}
+        .stat-card {{ background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%); color: white; padding: 20px; border-radius: 8px; text-align: center; }}
+        .stat-value {{ font-size: 28px; font-weight: bold; }}
+        .stat-label {{ font-size: 12px; opacity: 0.9; margin-top: 5px; }}
+        .file-item {{ background: #f9f9f9; padding: 12px; border-radius: 6px; margin: 8px 0; border-left: 4px solid transparent; }}
+        .file-item:hover {{ background: #f0f0f0; border-left-color: #e74c3c; }}
+        .file-header {{ display: flex; justify-content: space-between; align-items: center; }}
+        .file-name {{ font-weight: 500; color: #333; word-break: break-all; flex: 1; }}
+        .file-status {{ padding: 4px 8px; border-radius: 3px; font-size: 11px; font-weight: 600; white-space: nowrap; margin-left: 10px; }}
+        .status-idéntico {{ background: #e8f5e9; color: #2e7d32; }}
+        .status-contenido_diferente {{ background: #fff3cd; color: #856404; }}
+        .status-falta_en_remoto {{ background: #f8d7da; color: #721c24; }}
+        .status-falta_en_local {{ background: #d1ecf1; color: #0c5460; }}
+        .filter-buttons {{ display: flex; gap: 10px; margin: 15px 0; flex-wrap: wrap; }}
+        .filter-btn {{ padding: 8px 16px; border: 2px solid #ddd; background: white; border-radius: 4px; cursor: pointer; font-weight: 500; }}
+        .filter-btn.active {{ background: #e74c3c; color: white; border-color: #e74c3c; }}
+        .file-item.clickable {{ cursor: pointer; }}
+        .file-item.clickable:hover .file-name {{ color: #e74c3c; text-decoration: underline; }}
+        .diff-viewer {{ margin-top: 10px; display: none; border: 1px solid #ddd; border-radius: 6px; overflow: hidden; }}
+        .diff-viewer.open {{ display: block; }}
+        .diff-header {{ background: #333; color: white; padding: 8px 14px; font-size: 12px; display: flex; justify-content: space-between; align-items: center; }}
+        .diff-header .diff-title {{ font-family: monospace; }}
+        .diff-header .diff-close {{ cursor: pointer; color: #aaa; font-size: 16px; line-height: 1; }}
+        .diff-header .diff-close:hover {{ color: white; }}
+        .diff-cols {{ display: grid; grid-template-columns: 1fr 1fr; font-family: monospace; font-size: 12px; overflow-x: auto; }}
+        .diff-col-header {{ background: #555; color: #ccc; padding: 6px 10px; font-size: 11px; font-weight: bold; text-align: center; }}
+        .diff-table {{ width: 100%; border-collapse: collapse; }}
+        .diff-table td {{ padding: 1px 8px; white-space: pre; vertical-align: top; }}
+        .diff-table .ln {{ color: #999; text-align: right; min-width: 36px; user-select: none; border-right: 1px solid #ddd; padding-right: 6px; }}
+        .diff-row-equal td {{ background: #fff; color: #333; }}
+        .diff-row-replace td {{ background: #fff3cd; color: #856404; font-weight: bold; }}
+        .diff-row-replace-only-value td {{ background: #e3f2fd; color: #1565c0; }}
+        .diff-row-delete td {{ background: #ffeef0; color: #c0392b; }}
+        .diff-row-insert td {{ background: #e8f5e9; color: #27ae60; }}
+        .diff-row-empty td {{ background: #f5f5f5; color: #ccc; }}
+        .diff-loading {{ padding: 20px; text-align: center; color: #999; font-size: 13px; }}
+        @media (max-width: 768px) {{ .form-section {{ grid-template-columns: 1fr; }} h1 {{ font-size: 24px; }} .card {{ padding: 20px; }} .config-row {{ grid-template-columns: 1fr; }} .diff-cols {{ grid-template-columns: 1fr; }} }}
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🔍 Comparador de Directorios</h1>
+        <h1>Comparador de Directorios</h1>
 
         <div class="card">
-            <h2 style="color: #333; margin-bottom: 20px;">⚙️ Configuración</h2>
+            <div class="section-title">GESTIÓN DE CONFIGURACIONES SSH</div>
 
-            <div class="form-section">
-                <div class="form-group">
-                    <label for="local_path">📁 Ruta Local</label>
-                    <input type="text" id="local_path" placeholder="~/carpeta_local o /ruta/absoluta">
+            <div class="config-selector">
+                <div style="margin-bottom: 15px;">
+                    <h3 style="font-size: 14px; color: #333; margin-bottom: 10px;">Configuraciones Guardadas:</h3>
+                    <div id="saved_configs_list"></div>
                 </div>
 
-                <div class="form-group">
-                    <label for="remote_path">📁 Ruta Remota</label>
-                    <input type="text" id="remote_path" placeholder="~/carpeta_remota o /ruta/absoluta">
-                </div>
+                <div style="border-top: 1px solid #ddd; padding-top: 15px; margin-top: 15px;">
+                    <h3 style="font-size: 14px; color: #333; margin-bottom: 10px;"> Crear/Editar Configuración:</h3>
 
-                <div class="form-group">
-                    <label style="margin-bottom: 0;">Tipo de Comparación</label>
-                    <div class="checkbox-group" style="margin-top: 12px;">
-                        <input type="checkbox" id="is_remote">
-                        <label for="is_remote" style="margin: 0; font-weight: normal;">Remoto (SSH/SFTP)</label>
+                    <div class="form-section">
+                        <div class="form-group">
+                            <label for="config_name">Nombre de Configuración *</label>
+                            <input type="text" id="config_name" placeholder="Ej: Rodavigo, Admin Local, Producción">
+                        </div>
+
+                        <div class="form-group">
+                            <label for="ssh_host">Host SSH *</label>
+                            <input type="text" id="ssh_host" placeholder="10.10.29.152">
+                        </div>
+
+                        <div class="form-group">
+                            <label for="ssh_user">Usuario *</label>
+                            <input type="text" id="ssh_user" placeholder="rodavigo">
+                        </div>
+
+                        <div class="form-group">
+                            <label for="ssh_port">Puerto</label>
+                            <input type="text" id="ssh_port" placeholder="22" value="22">
+                        </div>
+
+                        <div class="form-group">
+                            <label for="auth_type">Tipo de Autenticacion</label>
+                            <select id="auth_type" onchange="toggleAuthFields()">
+                                <option value="key">Clave privada</option>
+                                <option value="password">Contraseña</option>
+                            </select>
+                        </div>
+
+                        <div class="form-group" id="key_field">
+                            <label for="ssh_key">Ruta de Clave SSH</label>
+                            <input type="text" id="ssh_key" placeholder="C:/Users/Joel/Desktop/Claves/dev26.rodavigo_openssh">
+                        </div>
+
+                        <div class="form-group" id="password_field" style="display: none;">
+                            <label for="ssh_password">Contraseña</label>
+                            <input type="password" id="ssh_password" placeholder="Contraseña SSH">
+                        </div>
+                    </div>
+
+                    <div class="button-group">
+                        <button class="btn-success" onclick="saveNewConfig()">Guardar Configuración</button>
+                        <button class="btn-danger" onclick="clearAllConfigs()" title="Borrar TODAS las configuraciones">Limpiar Todo</button>
                     </div>
                 </div>
             </div>
 
-            <!-- Configuración SSH -->
-            <div id="ssh_config" class="ssh-config">
-                <div style="grid-column: 1 / -1; background: white; padding: 12px; border-radius: 4px; border-left: 4px solid #e74c3c; margin-bottom: 10px; font-size: 13px; color: #555;">
-                    💡 <strong>Opciones de autenticación:</strong> Proporciona contraseña, clave SSH, o déjalas vacías si usas ssh-agent o claves por defecto en ~/.ssh/
-                </div>
-                <div class="form-group">
-                    <label for="ssh_host">🌐 Host SSH</label>
-                    <input type="text" id="ssh_host" placeholder="servidor.com">
-                </div>
+            <div class="info-box">
+                 <strong>Tip:</strong> Para comparar dos directorios locales:
+                    1. Desactiva el checkbox "Comparar con remoto (SSH/SFTP)"
+                    2. Escribe las dos rutas locales
+            </div>
+        </div>
 
-                <div class="form-group">
-                    <label for="ssh_user">👤 Usuario</label>
-                    <input type="text" id="ssh_user" placeholder="usuario">
-                </div>
+        <div class="card">
+            <div class="section-title">RUTAS A COMPARAR</div>
 
+            <div class="form-section">
                 <div class="form-group">
-                    <label for="ssh_port">🔌 Puerto</label>
-                    <input type="text" id="ssh_port" placeholder="22" value="22">
+                    <label for="local_path">Ruta 1</label>
+                    <input type="text" id="local_path" placeholder="C:/Code/dev26/app/Language/es">
                 </div>
 
                 <div class="form-group">
-                    <label>🔐 Autenticación</label>
-                    <select id="auth_method">
-                        <option value="password">Contraseña</option>
-                        <option value="key">Clave privada</option>
-                    </select>
+                    <label for="remote_path">Ruta 2</label>
+                    <input type="text" id="remote_path" placeholder="/home/rodavigo/web/rodavigo.net/app/Language/it">
                 </div>
 
-                <div class="form-group" id="password_group">
-                    <label for="ssh_password">🔑 Contraseña (opcional)</label>
-                    <input type="password" id="ssh_password" placeholder="Dejar vacío si no la necesita">
-                </div>
-
-                <div class="form-group" id="key_group" style="display: none;">
-                    <label for="ssh_key">🗝️ Ruta de Clave (opcional)</label>
-                    <input type="text" id="ssh_key" placeholder="~/.ssh/id_rsa">
+                <div style="grid-column: 1 / -1;">
+                    <input type="checkbox" id="is_remote" checked>
+                    <label for="is_remote" style="display: inline; font-weight: normal;">Comparar con remoto (SSH/SFTP)</label>
                 </div>
             </div>
 
-            <!-- Botones -->
             <div class="button-group">
-                <button class="btn-primary" id="compare_btn" onclick="compareDirectories()">
-                    🚀 Comparar Directorios
-                </button>
-                <button class="btn-reset" onclick="resetForm()">Limpiar</button>
+                <button class="btn-primary" onclick="compareDirectories()">Comparar Directorios</button>
+                <button class="btn-danger" onclick="clearForm()">Limpiar Rutas</button>
             </div>
 
-            <!-- Estado -->
             <div id="status" class="status"></div>
         </div>
 
-        <!-- Resultados -->
         <div id="results_section" class="card" style="display: none;">
-            <h2 style="color: #333; margin-bottom: 15px;">📊 Resultados</h2>
-
+            <h2>Resultados</h2>
             <div id="stats" class="stats"></div>
-
             <div class="filter-buttons">
                 <button class="filter-btn active" data-filter="all">Todos</button>
-                <button class="filter-btn" data-filter="idéntico">✓ Idénticos</button>
-                <button class="filter-btn" data-filter="contenido diferente">⚠️ Diferentes</button>
-                <button class="filter-btn" data-filter="falta en remoto">❌ Falta remoto</button>
-                <button class="filter-btn" data-filter="falta en local">❌ Falta local</button>
+                <button class="filter-btn" data-filter="idéntico">Identicos</button>
+                <button class="filter-btn" data-filter="contenido diferente">Diferentes</button>
+                <button class="filter-btn" data-filter="falta en remoto">Falta remoto</button>
+                <button class="filter-btn" data-filter="falta en local">Falta local</button>
             </div>
-
-            <div id="file_list" class="file-list"></div>
-        </div>
-
-        <!-- Detalles -->
-        <div id="details_section" class="card details">
-            <div class="detail-header">
-                <h3 id="detail_title"></h3>
-                <button class="close-detail" onclick="closeDetails()">✕ Cerrar</button>
-            </div>
-            <div id="detail_content"></div>
+            <div id="file_list"></div>
         </div>
     </div>
 
     <script>
         let allFiles = [];
         let currentFilter = 'all';
-        let isComparing = false;
+        let allConfigs = {{}};
 
-        // Event listeners
-        document.getElementById('is_remote').addEventListener('change', (e) => {
-            const sshConfig = document.getElementById('ssh_config');
-            if (e.target.checked) {
-                sshConfig.classList.add('visible');
-            } else {
-                sshConfig.classList.remove('visible');
-            }
-        });
+        function initConfigs() {{
+            allConfigs = {configs_json};
+            renderSavedConfigs();
+        }}
 
-        document.getElementById('auth_method').addEventListener('change', (e) => {
-            const passwordGroup = document.getElementById('password_group');
-            const keyGroup = document.getElementById('key_group');
-            if (e.target.value === 'password') {
-                passwordGroup.style.display = 'flex';
-                keyGroup.style.display = 'none';
-            } else {
-                passwordGroup.style.display = 'none';
-                keyGroup.style.display = 'flex';
-            }
-        });
+        function renderSavedConfigs() {{
+            const container = document.getElementById('saved_configs_list');
+            if (!allConfigs.configurations || allConfigs.configurations.length === 0) {{
+                container.innerHTML = '<p style="color: #999; font-size: 13px;">No hay configuraciones guardadas</p>';
+                return;
+            }}
 
-        document.querySelectorAll('.filter-btn').forEach(btn => {
-            btn.addEventListener('click', (e) => {
+            let html = '';
+            allConfigs.configurations.forEach(config => {{
+                html += `
+                    <div class="config-row">
+                        <div class="config-name"> ${{escapeHtml(config.name)}}</div>
+                        <button class="btn-secondary btn-small" onclick="loadConfig('${{escapeHtml(config.name)}}')">Cargar</button>
+                        <button class="btn-danger btn-small" onclick="deleteConfig('${{escapeHtml(config.name)}}')">Borrar</button>
+                    </div>
+                `;
+            }});
+            container.innerHTML = html;
+        }}
+
+        function loadConfig(configName) {{
+            const config = allConfigs.configurations.find(c => c.name === configName);
+            if (!config) return;
+
+            document.getElementById('config_name').value = config.name;
+            document.getElementById('ssh_host').value = config.hostname;
+            document.getElementById('ssh_user').value = config.username;
+            document.getElementById('ssh_port').value = config.port;
+            document.getElementById('ssh_key').value = config.key_file || '';
+            document.getElementById('ssh_password').value = config.password || '';
+            document.getElementById('auth_type').value = config.auth_type;
+            toggleAuthFields();
+            showStatus('Configuración cargada: ' + configName, 'success');
+        }}
+
+        function saveNewConfig() {{
+            const configName = document.getElementById('config_name').value.trim();
+            if (!configName) {{
+                showStatus('Ingresa un nombre para la configuración', 'error');
+                return;
+            }}
+
+            const config = {{
+                config_name: configName,
+                hostname: document.getElementById('ssh_host').value.trim(),
+                username: document.getElementById('ssh_user').value.trim(),
+                port: parseInt(document.getElementById('ssh_port').value) || 22,
+                key_file: document.getElementById('ssh_key').value.trim(),
+                password: document.getElementById('ssh_password').value.trim(),
+                auth_type: document.getElementById('auth_type').value,
+            }};
+
+            if (!config.hostname || !config.username) {{
+                showStatus('Host y Usuario SSH son requeridos', 'error');
+                return;
+            }}
+
+            fetch('/api/save_config', {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify(config)
+            }}).then(r => r.json()).then(data => {{
+                if (data.status === 'saved') {{
+                    showStatus('Configuración guardada: ' + configName, 'success');
+                    fetch('/api/load_all_configs').then(r => r.json()).then(configs => {{
+                        allConfigs = configs;
+                        renderSavedConfigs();
+                    }});
+                }} else {{
+                    showStatus('Error: ' + (data.error || 'Desconocido'), 'error');
+                }}
+            }}).catch(err => showStatus('Error: ' + err, 'error'));
+        }}
+
+        function deleteConfig(configName) {{
+            if (!confirm('¿Borrar configuración "' + configName + '"?')) return;
+
+            fetch('/api/delete_config', {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{config_name: configName}})
+            }}).then(r => r.json()).then(data => {{
+                if (data.status === 'deleted') {{
+                    showStatus('Configuración borrada', 'success');
+                    fetch('/api/load_all_configs').then(r => r.json()).then(configs => {{
+                        allConfigs = configs;
+                        renderSavedConfigs();
+                    }});
+                    document.getElementById('config_name').value = '';
+                }} else {{
+                    showStatus('Error: ' + (data.error || 'Desconocido'), 'error');
+                }}
+            }});
+        }}
+
+        function clearAllConfigs() {{
+            if (!confirm('¿Borrar TODAS las configuraciones SSH?')) return;
+
+            fetch('/api/clear_all_configs', {{method: 'POST'}})
+                .then(r => r.json())
+                .then(data => {{
+                    showStatus('Todas las configuraciones borradas', 'success');
+                    allConfigs = {{'configurations': [], 'last_used': null}};
+                    renderSavedConfigs();
+                    document.getElementById('config_name').value = '';
+                    document.getElementById('ssh_host').value = '';
+                    document.getElementById('ssh_user').value = '';
+                    document.getElementById('ssh_key').value = '';
+                    document.getElementById('ssh_password').value = '';
+                }});
+        }}
+
+        function toggleAuthFields() {{
+            const authType = document.getElementById('auth_type').value;
+            document.getElementById('key_field').style.display = authType === 'key' ? 'block' : 'none';
+            document.getElementById('password_field').style.display = authType === 'password' ? 'block' : 'none';
+        }}
+
+        function compareDirectories() {{
+            const data = {{
+                action: 'compare',
+                local_path: document.getElementById('local_path').value,
+                remote_path: document.getElementById('remote_path').value,
+                is_remote: document.getElementById('is_remote').checked,
+                ssh_host: document.getElementById('ssh_host').value,
+                ssh_user: document.getElementById('ssh_user').value,
+                ssh_port: document.getElementById('ssh_port').value,
+                ssh_key: document.getElementById('ssh_key').value,
+                ssh_password: document.getElementById('ssh_password').value,
+            }};
+
+            showStatus('Comparando directorios...', 'loading');
+
+            fetch('/', {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify(data)
+            }}).then(r => r.json()).then(result => {{
+                if (result.error) {{
+                    showStatus('Error: ' + result.error, 'error');
+                }} else {{
+                    showStatus(result.message, 'success');
+                    loadResults();
+                }}
+            }}).catch(err => showStatus('Error: ' + err, 'error'));
+        }}
+
+        function loadResults() {{
+            fetch('/api/results').then(r => r.json()).then(data => {{
+                allFiles = data.results;
+                renderStats(data.info);
+                renderResults();
+                document.getElementById('results_section').style.display = 'block';
+            }});
+        }}
+
+        function renderStats(info) {{
+            const stats = {{ total: 0, identical: 0, different: 0, missing: 0 }};
+            allFiles.forEach(f => {{
+                stats.total++;
+                if (f.status === 'idéntico') stats.identical++;
+                else if (f.status === 'contenido diferente') stats.different++;
+                else stats.missing++;
+            }});
+
+            document.getElementById('stats').innerHTML = `
+                <div class="stat-card"><div class="stat-value">${{stats.total}}</div><div class="stat-label">Total</div></div>
+                <div class="stat-card"><div class="stat-value">${{stats.identical}}</div><div class="stat-label">Identicos</div></div>
+                <div class="stat-card"><div class="stat-value">${{stats.different}}</div><div class="stat-label">Diferentes</div></div>
+                <div class="stat-card"><div class="stat-value">${{stats.missing}}</div><div class="stat-label">Faltantes</div></div>
+            `;
+        }}
+
+        function renderResults() {{
+            const filtered = currentFilter === 'all' ? allFiles : allFiles.filter(f => f.status === currentFilter);
+            let html = '';
+            filtered.forEach(file => {{
+                const statusClass = 'status-' + file.status.replace(/ /g, '_');
+                const isClickable = file.status === 'contenido diferente';
+                const clickAttr = isClickable ? `onclick="toggleDiff(this, '${{escapeHtml(file.path)}}')"` : '';
+                const clickableClass = isClickable ? ' clickable' : '';
+                const clickHint = isClickable ? '<span style="font-size:11px;color:#e74c3c;margin-left:8px;">▼ ver diff</span>' : '';
+                html += `
+                    <div class="file-item${{clickableClass}}" ${{clickAttr}}>
+                        <div class="file-header">
+                            <div class="file-name">${{escapeHtml(file.path)}}${{clickHint}}</div>
+                            <div class="file-status ${{statusClass}}">${{file.status}}</div>
+                        </div>
+                        ${{isClickable ? '<div class="diff-viewer"></div>' : ''}}
+                    </div>`;
+            }});
+            document.getElementById('file_list').innerHTML = html || '<p>Sin archivos</p>';
+        }}
+
+        function toggleDiff(itemEl, filePath) {{
+            const viewer = itemEl.querySelector('.diff-viewer');
+            if (!viewer) return;
+
+            if (viewer.classList.contains('open')) {{
+                viewer.classList.remove('open');
+                const hint = itemEl.querySelector('.file-name span');
+                if (hint) hint.textContent = '▼ ver diff';
+                return;
+            }}
+
+            viewer.classList.add('open');
+            const hint = itemEl.querySelector('.file-name span');
+            if (hint) hint.textContent = '▲ ocultar';
+
+            if (viewer.dataset.loaded === '1') return;
+
+            viewer.innerHTML = '<div class="diff-loading">Cargando diferencias...</div>';
+
+            fetch('/api/diff/' + encodeURIComponent(filePath))
+                .then(r => r.json())
+                .then(data => {{
+                    if (data.error) {{
+                        viewer.innerHTML = `<div class="diff-loading" style="color:#c0392b">Error: ${{escapeHtml(data.error)}}</div>`;
+                    }} else {{
+                        viewer.innerHTML = buildDiffHtml(data);
+                        viewer.dataset.loaded = '1';
+                    }}
+                }})
+                .catch(err => {{
+                    viewer.innerHTML = `<div class="diff-loading" style="color:#c0392b">Error de red: ${{err}}</div>`;
+                }});
+        }}
+
+        function buildDiffHtml(data) {{
+            const changes = data.changes;
+            let leftRows = '';
+            let rightRows = '';
+
+            changes.forEach(row => {{
+                let rowClass = 'diff-row-equal';
+                if (row.type === 'replace') rowClass = 'diff-row-replace';
+                else if (row.type === 'replace-only-value') rowClass = 'diff-row-replace-only-value';
+                else if (row.type === 'delete') rowClass = 'diff-row-delete';
+                else if (row.type === 'insert') rowClass = 'diff-row-insert';
+
+                const leftEmpty = row.remote_line === null;
+                const rightEmpty = row.local_line === null;
+
+                const leftLineClass = leftEmpty ? 'diff-row-empty' : rowClass;
+                const rightLineClass = rightEmpty ? 'diff-row-empty' : rowClass;
+
+                leftRows += `<tr class="${{leftLineClass}}">
+                    <td class="ln">${{leftEmpty ? '' : row.remote_line}}</td>
+                    <td>${{escapeHtml(row.remote_text || '')}}</td>
+                </tr>`;
+
+                rightRows += `<tr class="${{rightLineClass}}">
+                    <td class="ln">${{rightEmpty ? '' : row.local_line}}</td>
+                    <td>${{escapeHtml(row.local_text || '')}}</td>
+                </tr>`;
+            }});
+
+            return `
+                <div class="diff-header">
+                    <span class="diff-title">📄 ${{escapeHtml(data.path)}} — ${{data.remote_lines}} líneas remotas / ${{data.local_lines}} líneas locales</span>
+                </div>
+                <div class="diff-cols">
+                    <div>
+                        <div class="diff-col-header">← Remoto / Ruta 2</div>
+                        <table class="diff-table"><tbody>${{leftRows}}</tbody></table>
+                    </div>
+                    <div>
+                        <div class="diff-col-header">→ Local / Ruta 1</div>
+                        <table class="diff-table"><tbody>${{rightRows}}</tbody></table>
+                    </div>
+                </div>
+            `;
+        }}
+
+        function showStatus(message, type) {{
+            const statusDiv = document.getElementById('status');
+            statusDiv.className = `status show ${{type}}`;
+            statusDiv.textContent = message;
+        }}
+
+        function clearForm() {{
+            document.getElementById('local_path').value = '';
+            document.getElementById('remote_path').value = '';
+        }}
+
+        function escapeHtml(text) {{
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }}
+
+        document.querySelectorAll('.filter-btn').forEach(btn => {{
+            btn.addEventListener('click', (e) => {{
                 document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
                 e.target.classList.add('active');
                 currentFilter = e.target.dataset.filter;
                 renderResults();
-            });
-        });
+            }});
+        }});
 
-        function showStatus(message, type) {
-            const statusDiv = document.getElementById('status');
-            statusDiv.className = `status show ${type}`;
-
-            if (type === 'loading') {
-                statusDiv.innerHTML = `<span class="spinner"></span>${message}`;
-            } else {
-                statusDiv.textContent = message;
-            }
-        }
-
-        function compareDirectories() {
-            if (isComparing) return;
-
-            const localPath = document.getElementById('local_path').value.trim();
-            const remotePath = document.getElementById('remote_path').value.trim();
-            const isRemote = document.getElementById('is_remote').checked;
-
-            if (!localPath || !remotePath) {
-                showStatus('❌ Completa todas las rutas', 'error');
-                return;
-            }
-
-            isComparing = true;
-            document.getElementById('compare_btn').disabled = true;
-            showStatus('Comparando directorios...', 'loading');
-
-            const data = {
-                action: 'compare',
-                local_path: localPath,
-                remote_path: remotePath,
-                is_remote: isRemote,
-            };
-
-            if (isRemote) {
-                const sshHost = document.getElementById('ssh_host').value.trim();
-                const sshUser = document.getElementById('ssh_user').value.trim();
-                const sshPort = document.getElementById('ssh_port').value.trim();
-                const authMethod = document.getElementById('auth_method').value;
-
-                if (!sshHost || !sshUser) {
-                    showStatus('❌ Host y usuario SSH son requeridos', 'error');
-                    isComparing = false;
-                    document.getElementById('compare_btn').disabled = false;
-                    return;
-                }
-
-                data.ssh_host = sshHost;
-                data.ssh_user = sshUser;
-                data.ssh_port = sshPort;
-
-                if (authMethod === 'password') {
-                    data.ssh_password = document.getElementById('ssh_password').value;
-                } else {
-                    data.ssh_key = document.getElementById('ssh_key').value;
-                }
-            }
-
-            fetch('/', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(data)
-            })
-            .then(r => r.json())
-            .then(result => {
-                if (result.error) {
-                    showStatus(`❌ ${result.error}`, 'error');
-                } else {
-                    showStatus(`✅ ${result.message}`, 'success');
-                    loadResults();
-                }
-            })
-            .catch(e => {
-                showStatus(`❌ Error: ${e.message}`, 'error');
-            })
-            .finally(() => {
-                isComparing = false;
-                document.getElementById('compare_btn').disabled = false;
-            });
-        }
-
-        function loadResults() {
-            fetch('/api/results')
-                .then(r => r.json())
-                .then(data => {
-                    allFiles = data.results;
-                    renderStats(data.info);
-                    renderResults();
-                    document.getElementById('results_section').style.display = 'block';
-                });
-        }
-
-        function renderStats(info) {
-            const stats = {
-                total: info.total_files,
-                identical: 0,
-                different: 0,
-                missing: 0
-            };
-
-            allFiles.forEach(f => {
-                if (f.status === 'idéntico') stats.identical++;
-                else if (f.status === 'contenido diferente') stats.different++;
-                else stats.missing++;
-            });
-
-            document.getElementById('stats').innerHTML = `
-                <div class="stat-card">
-                    <div class="stat-value">${stats.total}</div>
-                    <div class="stat-label">Total</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value">${stats.identical}</div>
-                    <div class="stat-label">Idénticos</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value">${stats.different}</div>
-                    <div class="stat-label">Diferentes</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value">${stats.missing}</div>
-                    <div class="stat-label">Faltantes</div>
-                </div>
-            `;
-        }
-
-        function renderResults() {
-            const filtered = currentFilter === 'all' 
-                ? allFiles 
-                : allFiles.filter(f => f.status === currentFilter);
-
-            if (filtered.length === 0) {
-                document.getElementById('file_list').innerHTML = 
-                    '<div class="empty-state"><div class="empty-state-icon">📭</div><p>Sin archivos en esta categoría</p></div>';
-                return;
-            }
-
-            let html = '';
-            filtered.forEach((file, idx) => {
-                const statusClass = 'status-' + file.status.replace(/ /g, '_');
-                html += `
-                    <div class="file-item" onclick="showDetails('${escapeJs(file.path)}')">
-                        <div class="file-header">
-                            <div class="file-name">📄 ${escapeHtml(file.path)}</div>
-                            <div class="file-status ${statusClass}">${file.status}</div>
-                        </div>
-                    </div>
-                `;
-            });
-            document.getElementById('file_list').innerHTML = html;
-        }
-
-        function showDetails(path) {
-            document.getElementById('detail_title').textContent = path;
-            document.getElementById('detail_content').innerHTML = '<div class="loading"><span class="spinner"></span> Cargando...</div>';
-            document.getElementById('details_section').classList.add('show');
-
-            const file = allFiles.find(f => f.path === path);
-
-            if (file.status === 'contenido diferente') {
-                fetch(`/api/diff/${encodeURIComponent(path)}`)
-                    .then(r => r.json())
-                    .then(diffData => {
-                        // Generar HTML lado a lado
-                        let html = '<div class="diff-container">';
-
-                        // Encabezado con estadísticas
-                        html += `
-                            <div class="diff-stats">
-                                <div class="diff-stats-item">
-                                    <strong>Remoto:</strong> ${diffData.remote_lines} líneas
-                                </div>
-                                <div class="diff-stats-item">
-                                    <strong>Local:</strong> ${diffData.local_lines} líneas
-                                </div>
-                            </div>
-                        `;
-
-                        // Headers de columnas
-                        html += `
-                            <div class="diff-header-container">
-                                <div class="diff-column-header remote">📋 Remoto</div>
-                                <div class="diff-column-header local">📝 Local</div>
-                            </div>
-                        `;
-
-                        // Tabla de diff
-                        html += '<table class="diff-table">';
-
-                        diffData.changes.forEach(change => {
-                            const rowClass = change.type === 'equal' ? 'diff-equal' : 
-                                           change.type === 'delete' ? 'diff-delete' :
-                                           change.type === 'insert' ? 'diff-insert' : 'diff-replace';
-
-                            const remoteClass = change.type === 'replace' ? 'diff-replace-remote' : '';
-                            const localClass = change.type === 'replace' ? 'diff-replace-local' : '';
-
-                            html += `<tr class="diff-row ${rowClass}">`;
-
-                            // Columna remoto
-                            html += '<td class="diff-remote">';
-                            if (change.remote_line) {
-                                html += `<div style="display: flex;"><div class="diff-line-num">${change.remote_line}</div><div class="diff-line-content ${remoteClass}">${escapeHtml(change.remote_text)}</div></div>`;
-                            } else {
-                                html += '<div style="display: flex;"><div class="diff-line-num"></div><div class="diff-line-content" style="background: #f5f5f5;"></div></div>';
-                            }
-                            html += '</td>';
-
-                            // Columna local
-                            html += '<td class="diff-local">';
-                            if (change.local_line) {
-                                html += `<div style="display: flex;"><div class="diff-line-num">${change.local_line}</div><div class="diff-line-content ${localClass}">${escapeHtml(change.local_text)}</div></div>`;
-                            } else {
-                                html += '<div style="display: flex;"><div class="diff-line-num"></div><div class="diff-line-content" style="background: #f5f5f5;"></div></div>';
-                            }
-                            html += '</td>';
-
-                            html += '</tr>';
-                        });
-
-                        html += '</table>';
-                        html += '</div>';
-
-                        document.getElementById('detail_content').innerHTML = html;
-                    })
-                    .catch(e => {
-                        document.getElementById('detail_content').innerHTML = `
-                            <div style="color: #c62828; padding: 20px;">
-                                <strong>Error al cargar diff:</strong> ${escapeHtml(e.message)}
-                            </div>
-                        `;
-                    });
-            } else {
-                let info = '<p><strong>Estado:</strong> ' + file.status + '</p>';
-                if (file.local_exists) info += '<p>✓ Existe en local</p>';
-                if (file.remote_exists) info += '<p>✓ Existe en remoto</p>';
-                if (!file.local_exists) info += '<p style="color: #c62828;">✗ Falta en local</p>';
-                if (!file.remote_exists) info += '<p style="color: #c62828;">✗ Falta en remoto</p>';
-                info += `<p style="color: #999; font-size: 12px; margin-top: 10px;">Tamaño: ${(file.size / 1024).toFixed(2)} KB</p>`;
-                document.getElementById('detail_content').innerHTML = info;
-            }
-        }
-
-        function closeDetails() {
-            document.getElementById('details_section').classList.remove('show');
-        }
-
-        function resetForm() {
-            document.getElementById('local_path').value = '';
-            document.getElementById('remote_path').value = '';
-            document.getElementById('is_remote').checked = false;
-            document.getElementById('ssh_config').classList.remove('visible');
-            document.getElementById('status').classList.remove('show');
-            document.getElementById('results_section').style.display = 'none';
-            document.getElementById('details_section').classList.remove('show');
-            allFiles = [];
-            currentFilter = 'all';
-        }
-
-        function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
-        }
-
-        function escapeJs(text) {
-            return text.replace(/'/g, "\\'").replace(/"/g, '\\"');
-        }
+        initConfigs();
     </script>
 </body>
 </html>
@@ -1857,11 +1180,9 @@ def find_free_port():
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Comparador web de directorios local/remoto'
-    )
-    parser.add_argument('--port', type=int, default=0, help='Puerto (default: automático)')
-    parser.add_argument('--host', default='127.0.0.1', help='Host (default: 127.0.0.1)')
+    parser = argparse.ArgumentParser(description='Comparador web de directorios')
+    parser.add_argument('--port', type=int, default=0)
+    parser.add_argument('--host', default='127.0.0.1')
 
     args = parser.parse_args()
 
@@ -1870,12 +1191,13 @@ def main():
         server = HTTPServer((args.host, port), ComparatorWebHandler)
 
         print(f"\n{'=' * 70}")
-        print(f"🌐 Comparador de Directorios Web")
+        print(f"Comparador de Directorios v4.2")
+        print(f"Múltiples configuraciones SSH (Etiquetas PHP FIX)")
         print(f"{'=' * 70}")
-        print(f"\n✓ Servidor activo en: http://{args.host}:{port}")
-        print(f"\n💡 Abre esta URL en tu navegador")
-        print(f"📌 El servidor se mantiene activo - puedes hacer múltiples comparaciones")
-        print(f"\n⌨️  Presiona Ctrl+C para detener\n")
+        print(f"\nServidor activo en: http://{args.host}:{port}")
+        print(f"\nAbre esta URL en tu navegador")
+        print(f"Configuraciones guardadas en: {get_config_file()}")
+        print(f"\nPresiona Ctrl+C para detener\n")
 
         import webbrowser
         import time
@@ -1885,10 +1207,11 @@ def main():
         server.serve_forever()
 
     except KeyboardInterrupt:
-        print("\n\n✓ Servidor detenido")
+        print("\n\nServidor detenido")
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"Error: {e}")
 
 
 if __name__ == '__main__':
     main()
+
